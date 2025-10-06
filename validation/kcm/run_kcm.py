@@ -187,7 +187,7 @@ if __name__ == "__main__":
     spec = kcm_spectrum(station=0)
     nu = 15.69e-6
 
-    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", precision="float32", dealias_mode="two_thirds")
+    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float32", dealias_mode="two_thirds")
 
     # Build an initial field matching E_kcm(k)
     U0 = build_hit_initial_field(N, float(L.get() if hasattr(L,'get') else L),
@@ -203,6 +203,6 @@ if __name__ == "__main__":
     logger = RefTimeseriesLogger(path="temporals.txt", also_print=False)
     os.makedirs('SOLUT', exist_ok=True)
 
-    solver.run(T=0.38, cfl=0.8, fourier=0.3, log_every=1, sol_every=10,
+    solver.run(T=0.3125, cfl=0.8, fourier=0.3, log_every=1, sol_every=10,
                callback=logger)
     logger.close()
