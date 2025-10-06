@@ -32,8 +32,8 @@ for fname in files[::10]:
 
 plt.xlabel(r"Wavenumber $k$")
 plt.ylabel(r"Energy spectrum $E(k)$")
-plt.ylim(1e-3*Emax, Emax)
-plt.xlim(1, kmax/2.)
+plt.ylim(1e-3*Emax, Emax*2.)
+plt.xlim(None, kmax/2.)
 plt.title("Energy spectra evolution")
 # plt.legend(fontsize=8, loc="best")
 plt.grid(True, which="both", ls=":")

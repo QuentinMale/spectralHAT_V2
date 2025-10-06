@@ -51,22 +51,21 @@ class SpectralDNS:
         - "two_thirds": classic 2/3 truncation in each direction
         - "nyquist": keep all resolvable modes (no truncation)
         """
-        kx = (2*cp.pi) * fftfreq(self.Nx, d=self.L/self.Nx).astype(self.dtype)
-        ky = (2*cp.pi) * fftfreq(self.Ny, d=self.L/self.Ny).astype(self.dtype)
-        kz = (2*cp.pi) * rfftfreq(self.Nz, d=self.L/self.Nz).astype(self.dtype)
-        KX, KY, KZ = cp.meshgrid(kx, ky, kz, indexing="ij")
-        K = cp.sqrt(KX*KX + KY*KY + KZ*KZ)
-        kx_max = cp.max(cp.abs(kx)); ky_max = cp.max(cp.abs(ky)); kz_max = cp.max(cp.abs(kz))
-        k_nyq = cp.sqrt(kx_max*kx_max + ky_max*ky_max + kz_max*kz_max)
-        if mode == "nyquist":
-            kc = k_nyq
-            return (K < kc)
-
-        if mode == "two_thirds":
-            kc = (2.0/3.0) * k_nyq
-            return (K < kc)
-
         raise ValueError(f"Unknown dealias_mode: {mode!r}. Use 'two_thirds' or 'nyquist'.")
+        ix = cp.abs(cp.fft.fftfreq(self.Nx))*self.Nx
+        iy = cp.abs(cp.fft.fftfreq(self.Ny))*self.Ny
+        iz = cp.abs(cp.fft.rfftfreq(self.Nz))*self.Nz
+        IX, IY, IZ = cp.meshgrid(ix, iy, iz, indexing='ij')
+        if mode == "nyquist":
+            # Keep everything up to the FFT's resolvable limit.
+            cutx = (1.0)*(self.Nx//2)
+            cuty = (1.0)*(self.Ny//2)
+            cutz = (1.0)*(self.Nz//2)
+        if mode == "two_thirds":
+            cutx = (2.0/3.0)*(self.Nx//2)
+            cuty = (2.0/3.0)*(self.Ny//2)
+            cutz = (2.0/3.0)*(self.Nz//2)
+        return (IX < cutx) & (IY < cuty) & (IZ < cutz)
 
     # ---------------- utilities ----------------
     @staticmethod
@@ -193,7 +192,7 @@ class SpectralDNS:
         U = self._ifft3c(self.U_hat)
         umax = float(cp.max(cp.abs(U)).get())
         return umax
-    
+
     def _nu_eff_max(self):
         if self.les_model != "smagorinsky":
             return self.nu

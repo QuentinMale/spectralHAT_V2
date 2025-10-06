@@ -25,8 +25,9 @@ class RefTimeseriesLogger:
         # enstrophy & dissipation from solver
         Z = solver.enstrophy()
         eps = 2.0 * solver.nu * Z  # = dissipation rate = -dE/dt (theoretical)
+        div = solver.divergence_max()
 
-        print(f"[TG] t={t:.3f}, E={E:.6f}, Z={Z:.6f}")
+        print(f"[TG] t={t:.3f}, E={E:.6f}, Z={Z:.6f}, div={div:.6e}")
 
         # optional finite-difference estimate of -dE/dt for diagnostics
         dE_num = 0.0

@@ -169,10 +169,10 @@ def build_hit_initial_field(N, L, target_E_of_k, seed=1234):
     uhat = uhat * scale_field[None, :, :, :]
 
     def two_thirds_mask(N, L):
-        kx, ky, kz, K, K2 = make_wavenumbers(N, L)
+        kx, ky, kz, _, _ = make_wavenumbers(N, L)
         kmax = (N//2)*(2*cp.pi/L)
         kc = (2.0/3.0)*kmax
-        return (K < kc)
+        return (cp.abs(kx) <= kc) & (cp.abs(ky) <= kc) & (cp.abs(kz) <= kc)
 
     mask = two_thirds_mask(N, L)
     uhat = uhat * mask[None, ...]
