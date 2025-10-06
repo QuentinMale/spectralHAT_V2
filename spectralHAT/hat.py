@@ -7,7 +7,8 @@ from vtk.util import numpy_support as vtknp
 
 class SpectralDNS:
     def __init__(self, N=128, L=2*cp.pi, nu=1/1600, precision="float32",
-                 dealias_mode: str = "two_thirds"):
+                 dealias_mode: str = "two_thirds",
+                 les_model=None, Cs=0.17, delta=None):
         self.Nx = self.Ny = self.Nz = int(N)
         self.L = L
         self.nu = float(nu)
@@ -15,6 +16,14 @@ class SpectralDNS:
         self.cdtype = cp.complex64 if self.dtype == cp.float32 else cp.complex128
         self.zf = self.Nz//2 + 1
         self.dealias_mode = dealias_mode
+        self.les_model = les_model  # None or "smagorinsky"
+        self.Cs = float(Cs)
+        # filter width: default cube root of cell volume
+        if delta is None:
+            self.DELTA = float((self.L/self.Nx * self.L/self.Ny * self.L/self.Nz) ** (1.0/3.0))
+        else:
+            self.DELTA = float(delta)
+        self.nstep = 0
 
         # Real-space mesh (cached for ICs)
         grid = cp.mgrid[0:self.Nx, 0:self.Ny, 0:self.Nz].astype(self.dtype)
@@ -36,26 +45,26 @@ class SpectralDNS:
         # Work arrays allocated once
         self.U_hat = cp.zeros((3, self.Nx, self.Ny, self.zf), dtype=self.cdtype)
 
-
     def _build_dealias_mask(self, mode: str):
         """
         Returns a boolean mask in spectral space applied to the nonlinear term.
         - "two_thirds": classic 2/3 truncation in each direction
         - "nyquist": keep all resolvable modes (no truncation)
         """
+        kx = (2*cp.pi) * fftfreq(self.Nx, d=self.L/self.Nx).astype(self.dtype)
+        ky = (2*cp.pi) * fftfreq(self.Ny, d=self.L/self.Ny).astype(self.dtype)
+        kz = (2*cp.pi) * rfftfreq(self.Nz, d=self.L/self.Nz).astype(self.dtype)
+        KX, KY, KZ = cp.meshgrid(kx, ky, kz, indexing="ij")
+        K = cp.sqrt(KX*KX + KY*KY + KZ*KZ)
+        kx_max = cp.max(cp.abs(kx)); ky_max = cp.max(cp.abs(ky)); kz_max = cp.max(cp.abs(kz))
+        k_nyq = cp.sqrt(kx_max*kx_max + ky_max*ky_max + kz_max*kz_max)
         if mode == "nyquist":
-            # Keep everything up to the FFT's resolvable limit.
-            return cp.ones((self.Nx, self.Ny, self.zf), dtype=cp.bool_)
+            kc = k_nyq
+            return (K < kc)
 
         if mode == "two_thirds":
-            ix = cp.abs(cp.fft.fftfreq(self.Nx))*self.Nx
-            iy = cp.abs(cp.fft.fftfreq(self.Ny))*self.Ny
-            iz = cp.abs(cp.fft.rfftfreq(self.Nz))*self.Nz
-            IX, IY, IZ = cp.meshgrid(ix, iy, iz, indexing='ij')
-            cutx = (2.0/3.0)*(self.Nx//2)
-            cuty = (2.0/3.0)*(self.Ny//2)
-            cutz = (2.0/3.0)*(self.Nz//2)
-            return (IX < cutx) & (IY < cuty) & (IZ < cutz)
+            kc = (2.0/3.0) * k_nyq
+            return (K < kc)
 
         raise ValueError(f"Unknown dealias_mode: {mode!r}. Use 'two_thirds' or 'nyquist'.")
 
@@ -74,6 +83,42 @@ class SpectralDNS:
         wy = i*(self.KZ*U_hat[0] - self.KX*U_hat[2])
         wz = i*(self.KX*U_hat[1] - self.KY*U_hat[0])
         return cp.stack([wx, wy, wz], axis=0)
+
+    def _gradients_real(self, U_hat):
+        """du_i/dx_j in real space, shape (3,3,Nx,Ny,Nz)."""
+        i = 1j
+        # spectral derivatives (3,3,Nx,Ny,zf)
+        dU_hat = cp.stack([
+            cp.stack([i*self.KX*U_hat[0], i*self.KY*U_hat[0], i*self.KZ*U_hat[0]], axis=0),
+            cp.stack([i*self.KX*U_hat[1], i*self.KY*U_hat[1], i*self.KZ*U_hat[1]], axis=0),
+            cp.stack([i*self.KX*U_hat[2], i*self.KY*U_hat[2], i*self.KZ*U_hat[2]], axis=0),
+        ], axis=0)
+
+        # inverse FFT all derivatives at once -> real space (3,3,Nx,Ny,Nz)
+        G = irfftn(dU_hat, s=(self.Nx, self.Ny, self.Nz), axes=(-3, -2, -1))
+        return G
+
+    def _sgs_smagorinsky(self, U_hat):
+        G = self._gradients_real(U_hat)               # (3,3,Nx,Ny,Nz)
+        S = 0.5 * (G + cp.swapaxes(G, 0, 1))          # symmetric strain
+        Ssq = cp.sum(S*S, axis=(0,1))                 # sum_{i,j} S_ij^2
+        Smag = cp.sqrt(2.0*Ssq) + 1e-30
+        nu_t = (self.Cs*self.DELTA)**2 * Smag         # (Nx,Ny,Nz)
+
+        # τ_ij = 2 ν_t S_ij  (real space)
+        tau = 2.0 * S * nu_t[None, None, :, :, :]
+
+        # F_i = ∂_j τ_ij  (compute in spectral space)
+        t_x = rfftn(tau[:,0], axes=(-3,-2,-1))        # shape (3,Nx,Ny,zf) for j=x
+        t_y = rfftn(tau[:,1], axes=(-3,-2,-1))        # j=y
+        t_z = rfftn(tau[:,2], axes=(-3,-2,-1))        # j=z
+        i = 1j
+        F_hat = i*self.KX[None]*t_x + i*self.KY[None]*t_y + i*self.KZ[None]*t_z
+
+        # Dealias + project
+        F_hat *= self.dealias
+        F_hat = self._project_divfree(F_hat)
+        return F_hat
 
     def _project_divfree(self, A_hat):
         # P = I - kk^T/|k|^2
@@ -99,8 +144,16 @@ class SpectralDNS:
         N_hat *= self.dealias
         N_hat = self._project_divfree(N_hat)
 
-        # viscous term
-        return N_hat - (self.nu * self.K2)[None, ...] * U_hat
+        # molecular viscosity
+        visc_hat = -(self.nu * self.K2)[None, ...] * U_hat
+
+        # SGS Smagorinsky (explicit)
+        if self.les_model == "smagorinsky":
+            F_hat = self._sgs_smagorinsky(U_hat)
+        else:
+            F_hat = 0.0
+
+        return N_hat + visc_hat + F_hat
 
     def _rk4(self, U_hat, dt):
         k1 = self._rhs(U_hat)
@@ -108,6 +161,12 @@ class SpectralDNS:
         k3 = self._rhs(U_hat + 0.5*dt*k2)
         k4 = self._rhs(U_hat + dt*k3)
         return U_hat + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+    def divergence_max(self):
+        i = 1j
+        div_hat = i * (self.KX*self.U_hat[0] + self.KY*self.U_hat[1] + self.KZ*self.U_hat[2])
+        div = self._ifft3c(div_hat)
+        return float(cp.max(cp.abs(div)).get())
 
     # ---------------- public API ----------------
     def prepare_ic(self, ic_func):
@@ -134,6 +193,20 @@ class SpectralDNS:
         U = self._ifft3c(self.U_hat)
         umax = float(cp.max(cp.abs(U)).get())
         return umax
+    
+    def _nu_eff_max(self):
+        if self.les_model != "smagorinsky":
+            return self.nu
+        # cheap estimate using current field (call when computing dt_four)
+        G = self._gradients_real(self.U_hat)
+        S = 0.5*(G + cp.swapaxes(G,0,1))
+        Ssq = cp.zeros_like(S[0,0])
+        for i in range(3):
+            for j in range(3):
+                Ssq = Ssq + S[i,j]*S[i,j]
+        Smag = cp.sqrt(2.0*Ssq) + 1e-30
+        nu_t_max = float(cp.max((self.Cs*self.DELTA)**2 * Smag).get())
+        return self.nu + nu_t_max
 
     def run(self, T, cfl=0.5, fourier=0.8, max_dt=None, min_dt=None,
             callback=None, log_every=10, sol_every=None, emit_first=True):
@@ -164,7 +237,8 @@ class SpectralDNS:
             # --- compute adaptive timestep ---
             umax = self._umax()
             dt_cfl  = cfl * self.dx_min / umax if umax > 0.0 else float("inf")
-            dt_four = fourier * alpha_rk4 / (self.nu * k2max) if viscous_active else float("inf")
+            nu_for_dt = self._nu_eff_max() if viscous_active else 0.0
+            dt_four = fourier * alpha_rk4 / (nu_for_dt * k2max) if viscous_active else float("inf")
             dt = min(dt_cfl, dt_four, T - t)
 
             if max_dt is not None: dt = min(dt, max_dt)
@@ -176,6 +250,7 @@ class SpectralDNS:
             self.U_hat = self._rk4(self.U_hat, dt)
             t += dt
             n += 1
+            self.nstep = n
 
             # --- iteration-based output ---
             if log_every is not None and callback is not None:
