@@ -1,6 +1,9 @@
 # spectral_dns_cupy.py
 import cupy as cp
+import numpy as np
 from cupyx.scipy.fft import rfftn, irfftn, rfftfreq, fftfreq
+import vtk
+from vtk.util import numpy_support as vtknp
 
 class SpectralDNS:
     def __init__(self, N=128, L=2*cp.pi, nu=1/1600, precision="float32",
@@ -18,9 +21,9 @@ class SpectralDNS:
         self.X = grid * (self.L/self.Nx)  # [x,y,z] on GPU
 
         # Spectral wavenumbers
-        kx = (2*cp.pi/self.L) * fftfreq(self.Nx, d=self.L/self.Nx).astype(self.dtype)
-        ky = (2*cp.pi/self.L) * fftfreq(self.Ny, d=self.L/self.Ny).astype(self.dtype)
-        kz = (2*cp.pi/self.L) * rfftfreq(self.Nz, d=self.L/self.Nz).astype(self.dtype)
+        kx = (2*cp.pi) * fftfreq(self.Nx, d=self.L/self.Nx).astype(self.dtype)
+        ky = (2*cp.pi) * fftfreq(self.Ny, d=self.L/self.Ny).astype(self.dtype)
+        kz = (2*cp.pi) * rfftfreq(self.Nz, d=self.L/self.Nz).astype(self.dtype)
         self.KX, self.KY, self.KZ = cp.meshgrid(kx, ky, kz, indexing='ij')
         self.K2 = self.KX**2 + self.KY**2 + self.KZ**2
         self.invK2 = cp.where(self.K2 == 0, 0, 1.0/self.K2).astype(self.dtype)
@@ -129,67 +132,60 @@ class SpectralDNS:
 
     def _umax(self):
         U = self._ifft3c(self.U_hat)
-        umax = float(cp.sqrt(U[0]**2 + U[1]**2 + U[2]**2).max().get())
+        umax = float(cp.max(cp.abs(U)).get())
         return umax
 
     def run(self, T, cfl=0.5, fourier=0.8, max_dt=None, min_dt=None,
-                    callback=None, out_interval=None, return_final=False):
+            callback=None, log_every=10, sol_every=None, emit_first=True):
         """
-        Advance to time T using adaptive dt = min(dt_CFL, dt_Fourier).
-        - cfl:     safety factor for advection CFL
-        - fourier: safety factor for diffusion/RK4
-        - max_dt/min_dt: optional clamps
-        - out_interval: call callback(t, stats, self) at multiples of this time
+        Advance until physical time T with adaptive dt = min(dt_CFL, dt_Fourier).
         """
         assert T >= 0.0
-        t = 0.0
-        next_out = out_interval if out_interval else None
-        alpha_rk4 = 2.785  # RK4 stability bound on negative real axis
+        if log_every is not None and log_every <= 0:
+            log_every = None
 
-        # precomputed constants
+        t = 0.0
+        n = 0
+        alpha_rk4 = 2.785  # RK4 stability bound
+
         if not hasattr(self, "dx_min"):
             self.__post_init_precompute()
         k2max = self.k2_max
         viscous_active = (self.nu > 0.0 and k2max > 0.0)
 
+        if emit_first:
+            if log_every > 0 and callback is not None:
+                self._maybe_callback(t, callback)
+            if sol_every > 0:
+                fname = f"SOLUT/velocity_{n:06d}.vti"
+                self.save_velocity_vti(fname)
+
         while t < T:
-            # --- choose dt ---
+            # --- compute adaptive timestep ---
             umax = self._umax()
-            if umax > 0.0:
-                dt_cfl = cfl * self.dx_min / umax
-            else:
-                dt_cfl = float("inf")
-
-            if viscous_active:
-                dt_four = fourier * alpha_rk4 / (self.nu * k2max)
-            else:
-                dt_four = float("inf")
-
+            dt_cfl  = cfl * self.dx_min / umax if umax > 0.0 else float("inf")
+            dt_four = fourier * alpha_rk4 / (self.nu * k2max) if viscous_active else float("inf")
             dt = min(dt_cfl, dt_four, T - t)
-            if max_dt is not None:
-                dt = min(dt, max_dt)
-            if min_dt is not None:
-                dt = max(dt, min_dt)
+
+            if max_dt is not None: dt = min(dt, max_dt)
+            if min_dt is not None: dt = max(dt, min_dt)
             if not (dt > 0.0 and cp.isfinite(dt)):
                 raise RuntimeError("Adaptive dt became non-positive or non-finite.")
 
-            # --- advance one RK4 step ---
+            # --- iteration-based callback output ---
             self.U_hat = self._rk4(self.U_hat, dt)
             t += dt
+            n += 1
 
-            # --- output callback on time grid ---
-            if next_out is not None:
-                # fire for all missed intervals (in case dt > out_interval)
-                while t + 1e-12 >= next_out and next_out <= T:
-                    self._maybe_callback(next_out, callback)
-                    next_out += out_interval
+            # --- iteration-based output ---
+            if log_every is not None and callback is not None:
+                if n % int(log_every) == 0:
+                    self._maybe_callback(t, callback)
 
-        # final callback if no interval specified
-        if out_interval is None and callback is not None:
-            self._maybe_callback(t, callback)
-
-        if return_final:
-            return self.U_hat
+            # --- write velocity field every N iterations ---
+            if sol_every is not None and (n % int(sol_every) == 0):
+                fname = f"SOLUT/velocity_{n:06d}.vti"
+                self.save_velocity_vti(fname)
 
     def kinetic_energy(self):
         U = self._ifft3c(self.U_hat)
@@ -201,7 +197,7 @@ class SpectralDNS:
         stats = {"t": float(t), "kinetic_energy": self.kinetic_energy()}
         callback(t, stats, self)
 
-    def energy_spectrum(self, return_numpy: bool = True):
+    def energy_spectrum(self):
         """
         Spherically averaged energy spectrum E(k) using rFFT data in self.U_hat.
         - Uses existing KX, KY, KZ (rFFT grid along z).
@@ -258,7 +254,66 @@ class SpectralDNS:
             # Add shell power into bins: E_k[m] += (0.5|F|^2)/dk
             cp.add.at(E_k, m[valid], (mag2_half[valid] / dk))
 
-        return k_grid, E_k, dk
+        return np.asarray(k_grid.get()), np.asarray(E_k.get()), dk
+    
+    def save_velocity_vti(self, filename="velocity.vti"):
+        """
+        Save the current velocity field to a VTK .vti file (ImageData format)
+        readable by ParaView/VisIt.
+
+        Writes point-centered velocity vector 'Velocity' with components (u,v,w).
+        """
+        # Inverse transform to real space
+        U = self._ifft3c(self.U_hat)
+        # Move to host
+        U = [u.get() for u in U]
+
+        u, v, w = U
+        Nx, Ny, Nz = u.shape
+        dx = self.L / Nx
+        dy = self.L / Ny
+        dz = self.L / Nz
+
+        # Create VTK image data object
+        imageData = vtk.vtkImageData()
+        imageData.SetDimensions(Nx, Ny, Nz)
+        imageData.SetSpacing(dx, dy, dz)
+        imageData.SetOrigin(0.0, 0.0, 0.0)
+
+        # Stack velocity components and flatten (VTK wants Fortran order)
+        V = np.stack([u, v, w], axis=-1).astype(np.float32)
+        V_flat = np.ascontiguousarray(V.reshape(-1, 3), dtype=np.float32)
+
+        # Convert to VTK array and attach as point data
+        vtk_array = vtknp.numpy_to_vtk(num_array=V_flat, deep=True, array_type=vtk.VTK_FLOAT)
+        vtk_array.SetName("Velocity")
+        imageData.GetPointData().AddArray(vtk_array)
+        imageData.GetPointData().SetActiveVectors("Velocity")
+
+        # Write .vti file
+        writer = vtk.vtkXMLImageDataWriter()
+        writer.SetFileName(filename)
+        writer.SetInputData(imageData)
+        writer.Write()
+
+        print(f"Velocity field saved to {filename} (VTK ImageData)")
+
+    def enstrophy(self):
+        """
+        Enstrophy Z = 0.5 * <|ω|^2>, with ω = curl(u).
+        Uses current spectral field self.U_hat.
+        """
+        W_hat = self._curl_hat(self.U_hat)     # ω̂ = i k × û
+        W = self._ifft3c(W_hat)                # ω in real space
+        Z = 0.5 * (W[0]**2 + W[1]**2 + W[2]**2).mean()
+        return float(Z.get())
+
+    def dissipation(self):
+        """
+        Dissipation ε = 2 * ν * Z for incompressible, periodic flow.
+        """
+        Z = self.enstrophy()
+        return 2.0 * self.nu * Z
 
 # ----------- example ICs and usage -----------
 def taylor_green_ic(X):
@@ -274,7 +329,7 @@ if __name__ == "__main__":
 
     # Run 1: Taylor–Green for T=0.05
     solver.prepare_ic(taylor_green_ic)
-    solver.run(T=10.0, cfl=0.8, fourier=0.3, out_interval=0.01,
+    solver.run(T=10.0, cfl=0.8, fourier=0.3, log_every=1,
                callback=lambda t, s, _: print(f"[TG] t={s['t']:.3f}, E={s['kinetic_energy']:.6f}"))
     
     k, E_k, dk = solver.energy_spectrum()
