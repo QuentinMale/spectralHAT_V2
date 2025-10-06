@@ -51,7 +51,7 @@ class SpectralDNS:
         - "two_thirds": classic 2/3 truncation in each direction
         - "nyquist": keep all resolvable modes (no truncation)
         """
-        raise ValueError(f"Unknown dealias_mode: {mode!r}. Use 'two_thirds' or 'nyquist'.")
+        
         ix = cp.abs(cp.fft.fftfreq(self.Nx))*self.Nx
         iy = cp.abs(cp.fft.fftfreq(self.Ny))*self.Ny
         iz = cp.abs(cp.fft.rfftfreq(self.Nz))*self.Nz
@@ -61,10 +61,12 @@ class SpectralDNS:
             cutx = (1.0)*(self.Nx//2)
             cuty = (1.0)*(self.Ny//2)
             cutz = (1.0)*(self.Nz//2)
-        if mode == "two_thirds":
+        elif mode == "two_thirds":
             cutx = (2.0/3.0)*(self.Nx//2)
             cuty = (2.0/3.0)*(self.Ny//2)
             cutz = (2.0/3.0)*(self.Nz//2)
+        else:
+            raise ValueError(f"Unknown dealias_mode: {mode!r}. Use 'two_thirds' or 'nyquist'.")
         return (IX < cutx) & (IY < cuty) & (IZ < cutz)
 
     # ---------------- utilities ----------------
