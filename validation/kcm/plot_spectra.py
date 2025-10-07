@@ -37,7 +37,7 @@ for fname in files:
 times = np.array(times)
 
 # ---- target times and nearest files ----
-target_times = np.array([0.0, 0.1116071429, 0.2232142857, 0.3125])
+target_times = np.array([0.0, 0.1357142857, 0.2714285714, 0.38])
 nearest_idx = []
 for tt in target_times:
     i = int(np.nanargmin(np.abs(times - tt)))
@@ -72,6 +72,7 @@ for j, i in enumerate(nearest_idx):
     plt.loglog(k[1:], Ek_th[1:], ls="--", lw=1.8, color=colors[j % len(colors)],
                label=f"Theory (station {j})")
 
+knyq /= 2
 # ---- cosmetics & limits ----
 plt.xlabel(r"Wavenumber $k$")
 plt.ylabel(r"Energy spectrum $E(k)$")

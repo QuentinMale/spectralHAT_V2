@@ -68,7 +68,7 @@ if __name__ == "__main__":
     nu = V0 * Lc / Re
     tc = Lc / V0
 
-    solver = SpectralDNS(N=N, L=Lbox, nu=nu, precision="float32", dealias_mode="two_thirds")
+    solver = SpectralDNS(N=N, L=Lbox, nu=nu, precision="float32", dealias_mode="phase_shift")
     solver.prepare_ic(lambda X: taylor_green_ic(X, Lc=Lc, V0=V0))
 
     logger = RefTimeseriesLogger(path="temporals.txt", also_print=False)

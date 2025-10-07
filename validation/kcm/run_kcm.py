@@ -88,6 +88,68 @@ class kcm_spectrum:
     espec = self.ckEpsTwo3rd_*pow(k,-1.66666666666667)*term1 * np.exp(-self.alfa_[3]*keta) * (1.0 + self.alfa_[4]*term2)
     return espec
 
+# ---------- Rescale field to match spectrum ----------
+def rescale_to_kcm(UVEL, L, N, station=0):
+    """
+    UVEL: (u,v,w) as CuPy arrays (Nx,Ny,Nz), L: box length, N: grid size.
+    Returns (u,v,w) CuPy arrays rescaled so that the spherically-averaged
+    1D spectrum matches the KCM target at the shell centers.
+    """
+    u, v, w = UVEL
+    assert isinstance(u, cp.ndarray) and isinstance(v, cp.ndarray) and isinstance(w, cp.ndarray)
+    nx = ny = nz = int(N)
+    nt = nx*ny*nz
+    dk = 2.0*np.pi / float(L)
+
+    # TKE (physical)
+    tke_phys = 0.5 * float(cp.mean(u*u + v*v + w*w).get())
+    print(f"tke from original velocity field = {tke_phys:.6e}")
+
+    # FFT with 1/nt normalization (Parseval-friendly)
+    uh = cp.fft.fftn(u) / nt
+    vh = cp.fft.fftn(v) / nt
+    wh = cp.fft.fftn(w) / nt
+
+    # Wavenumber grid (rad/length)
+    kx = 2.0*np.pi * cp.fft.fftfreq(nx, d=L/nx)
+    ky = 2.0*np.pi * cp.fft.fftfreq(ny, d=L/ny)
+    kz = 2.0*np.pi * cp.fft.fftfreq(nz, d=L/nz)
+    KX, KY, KZ = cp.meshgrid(kx, ky, kz, indexing='ij')
+    kk = cp.sqrt(KX*KX + KY*KY + KZ*KZ)
+
+    # Shell index m ~ round(kk/dk)
+    m = cp.floor(kk/dk + 0.5).astype(cp.int64)
+    mmax = nx//2
+    m = cp.clip(m, 0, mmax)
+
+    # Measured spectrum E(k): sum_shell 0.5|û|^2 then divide by dk
+    tkeh = 0.5 * (cp.abs(uh)**2 + cp.abs(vh)**2 + cp.abs(wh)**2)
+    E_meas = cp.bincount(m.ravel(), weights=tkeh.ravel(), minlength=mmax+1) / dk
+
+    # Target spectrum at shell centers
+    k_centers = (cp.arange(mmax+1) + 0.5) * dk
+    E_tgt = cp.asarray(kcm_spectrum(station=station).evaluate(cp.asnumpy(k_centers)))
+
+    print(f"tke from original spectrum = {float(cp.trapz(E_meas, dx=dk).get()):.6e}")
+
+    # Per-shell scaling (safe)
+    eps = 1e-30
+    R = cp.sqrt(cp.maximum(E_tgt, 0.0) / cp.maximum(E_meas, eps))
+    uh *= R[m]
+    vh *= R[m]
+    wh *= R[m]
+
+    # Check rescaled spectrum/TKE
+    tkeh2 = 0.5 * (cp.abs(uh)**2 + cp.abs(vh)**2 + cp.abs(wh)**2)
+    E_rescaled = cp.bincount(m.ravel(), weights=tkeh2.ravel(), minlength=mmax+1) / dk
+    print(f"tke from rescaled spectrum = {float(cp.trapz(E_rescaled, dx=dk).get()):.6e}")
+
+    # IFFT (undo 1/nt by multiplying by nt)
+    u2 = cp.fft.ifftn(uh * nt).real
+    v2 = cp.fft.ifftn(vh * nt).real
+    w2 = cp.fft.ifftn(wh * nt).real
+    return u2, v2, w2
+
 # ----- Utilities for HIT IC construction -----
 def make_wavenumbers(N, L):
     """Return kx, ky, kz (CuPy) and |k|, with 2π periodicity for box length L."""
@@ -168,14 +230,14 @@ def build_hit_initial_field(N, L, target_E_of_k, seed=1234):
     scale_field = scale[shell_ids]  # shape (N,N,N)
     uhat = uhat * scale_field[None, :, :, :]
 
-    def two_thirds_mask(N, L):
-        kx, ky, kz, _, _ = make_wavenumbers(N, L)
-        kmax = (N//2)*(2*cp.pi/L)
-        kc = (2.0/3.0)*kmax
-        return (cp.abs(kx) <= kc) & (cp.abs(ky) <= kc) & (cp.abs(kz) <= kc)
+    # def two_thirds_mask(N, L):
+    #     kx, ky, kz, _, _ = make_wavenumbers(N, L)
+    #     kmax = (N//2)*(2*cp.pi/L)
+    #     kc = (2.0/3.0)*kmax
+    #     return (cp.abs(kx) <= kc) & (cp.abs(ky) <= kc) & (cp.abs(kz) <= kc)
 
-    mask = two_thirds_mask(N, L)
-    uhat = uhat * mask[None, ...]
+    # mask = two_thirds_mask(N, L)
+    # uhat = uhat * mask[None, ...]
 
     # 5) IFFT back to real space
     U = cp.fft.ifftn(uhat, axes=(1,2,3)).real.astype(cp.float32)
@@ -187,22 +249,38 @@ if __name__ == "__main__":
     spec = kcm_spectrum(station=0)
     nu = 15.69e-6
 
-    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float32", dealias_mode="two_thirds")
-
-    # Build an initial field matching E_kcm(k)
-    U0 = build_hit_initial_field(N, float(L.get() if hasattr(L,'get') else L),
-                                 target_E_of_k=spec.evaluate,
-                                 seed=42)
+    os.makedirs('SOLUT', exist_ok=True)
 
     # Prepare IC: ignore X, just return our precomputed field
     def hit_ic(_X):
         return U0
 
+    # ---------------- First run to have a realistic turbulent field
+    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float32", dealias_mode="phase_shift")
+
+    # Build an initial field matching E_kcm(k)
+    U0 = build_hit_initial_field(N, float(L.get() if hasattr(L,'get') else L),
+                                 target_E_of_k=spec.evaluate,
+                                 seed=42)
     solver.prepare_ic(hit_ic)
 
     logger = RefTimeseriesLogger(path="temporals.txt", also_print=False)
-    os.makedirs('SOLUT', exist_ok=True)
+    solver.run(T=0.38, cfl=0.8, fourier=0.3, log_every=1,
+               callback=logger)
+    logger.close()
+    u, v, w = solver.get_velocity_real()
 
-    solver.run(T=0.3125, cfl=0.8, fourier=0.3, log_every=1, sol_every=10,
+    os.system('rm -r SOLUT/* SPECTRA/*')
+
+    # ---------------- Second run rescaling the velocity field to match the target initial spectrum
+    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float32", dealias_mode="phase_shift")
+
+    # Rescale
+    u2, v2, w2 = rescale_to_kcm((u, v, w), L=solver.L, N=solver.Nx, station=0)    
+    U0 = cp.stack([u2, v2, w2], axis=0).astype(solver.dtype, copy=False)
+    solver.prepare_ic(hit_ic)
+
+    logger = RefTimeseriesLogger(path="temporals.txt", also_print=False)
+    solver.run(T=0.38, cfl=0.8, fourier=0.3, log_every=1, sol_every=10,
                callback=logger)
     logger.close()
