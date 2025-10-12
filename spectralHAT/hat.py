@@ -6,9 +6,10 @@ import vtk
 from vtk.util import numpy_support as vtknp
 
 class SpectralDNS:
-    def __init__(self, N=128, L=2*cp.pi, nu=1/1600, precision="float32",
+    def __init__(self, N=128, L=2*cp.pi, nu=1/1600, precision="float64",
                  dealias_mode: str = "two_thirds",
-                 les_model=None, Cs=0.17, delta=None):
+                 les_model=None, Cs=0.17, delta=None,
+                 forcing_eps=None):
         self.Nx = self.Ny = self.Nz = int(N)
         self.L = L
         self.nu = float(nu)
@@ -23,6 +24,7 @@ class SpectralDNS:
             self.DELTA = float((self.L/self.Nx * self.L/self.Ny * self.L/self.Nz) ** (1.0/3.0))
         else:
             self.DELTA = float(delta)
+        self.forcing_eps = float(forcing_eps) if forcing_eps is not None else None
         self.nstep = 0
 
         # Real-space mesh (cached for ICs)
@@ -37,6 +39,10 @@ class SpectralDNS:
         self.K2 = self.KX**2 + self.KY**2 + self.KZ**2
         self.invK2 = cp.where(self.K2 == 0, 0, 1.0/self.K2).astype(self.dtype)
 
+        self.Kmag = cp.sqrt(self.K2).astype(self.dtype)
+        # low-pass filter on the rFFT grid for low-k forcing
+        self._G_lowk = self._build_lowpass(4.0*cp.pi/self.L, "sharp").astype(self.dtype)
+
         # --- build dealiasing mask based on mode ---
         self.dealias = self._build_dealias_mask(self.dealias_mode)
 
@@ -50,16 +56,14 @@ class SpectralDNS:
         Returns a boolean mask in spectral space applied to the nonlinear term.
         - "two_thirds": classic 2/3 truncation in each direction
         - "nyquist": keep all resolvable modes (no truncation)
-        - "phase_shift": handled in _rhs via grid-shift; mask = all True
+        - "phase_shift": handled in _rhs via grid-shift
+        - "three_halves": 3/2 padding
         """
-        if mode == "phase_shift":
-            return cp.ones((self.Nx, self.Ny, self.zf), dtype=cp.bool_)
-
         ix = cp.abs(cp.fft.fftfreq(self.Nx))*self.Nx
         iy = cp.abs(cp.fft.fftfreq(self.Ny))*self.Ny
         iz = cp.abs(cp.fft.rfftfreq(self.Nz))*self.Nz
         IX, IY, IZ = cp.meshgrid(ix, iy, iz, indexing='ij')
-        if mode == "nyquist":
+        if (mode == "nyquist") or (mode == "phase_shift") or (mode == "three_halves"):
             cutx = (1.0)*(self.Nx//2)
             cuty = (1.0)*(self.Ny//2)
             cutz = (1.0)*(self.Nz//2)
@@ -68,8 +72,60 @@ class SpectralDNS:
             cuty = (2.0/3.0)*(self.Ny//2)
             cutz = (2.0/3.0)*(self.Nz//2)
         else:
-            raise ValueError(f"Unknown dealias_mode: {mode!r}. Use 'two_thirds', 'nyquist', or 'phase_shift'.")
+            raise ValueError(f"Unknown dealias_mode: {mode!r}."
+                              "Use 'two_thirds', 'nyquist', 'phase_shift' or '3/2 padding'.")
         return (IX < cutx) & (IY < cuty) & (IZ < cutz)
+
+    def _build_lowpass(self, kf: float, kind: str = "sharp"):
+        """Return low-pass G(k,kf) on the rFFT grid."""
+        if kind == "sharp":
+            return (self.Kmag <= kf).astype(self.dtype)
+        elif kind == "gaussian":
+            # smooth low-pass: exp(-(k/kf)^4) (steeper than ^2, common in HIT)
+            r = self.Kmag / float(kf)
+            return cp.exp(-(r**4)).astype(self.dtype)
+        else:
+            raise ValueError(f"Unknown forcing_filter '{kind}', use 'sharp' or 'gaussian'.")
+
+    def _pad3_halfrfft(self, A_hat, Np):
+        """
+        Zero-pad a 3D rFFT half-spectrum A_hat (Nx,Ny,Nz//2+1) to (Np,Np,Np//2+1).
+        Assumes even Nx,Ny,Nz and Np = 3*Nx//2.
+        Returns complex array on GPU.
+        """
+        Nx, Ny, zf = A_hat.shape
+        assert Nx == self.Nx and Ny == self.Ny and zf == self.zf
+        assert Np % 2 == 0 and Nx % 2 == 0 and Ny % 2 == 0
+
+        zfp = Np//2 + 1
+        out = cp.zeros((Np, Np, zfp), dtype=A_hat.dtype)
+
+        nxh = Nx//2; nyh = Ny//2  # Nyquist plane indices in x,y
+
+        # Low-k blocks (remember: last axis is half-spectrum and copies directly)
+        out[0:nxh+1, 0:nyh+1, :zf] = A_hat[0:nxh+1, 0:nyh+1, :]
+        out[0:nxh+1, Np-(Ny-nyh-1):Np, :zf] = A_hat[0:nxh+1, nyh+1:Ny, :]
+        out[Np-(Nx-nxh-1):Np, 0:nyh+1, :zf] = A_hat[nxh+1:Nx, 0:nyh+1, :]
+        out[Np-(Nx-nxh-1):Np, Np-(Ny-nyh-1):Np, :zf] = A_hat[nxh+1:Nx, nyh+1:Ny, :]
+
+        # z half-spectrum is already correct size in 'out'; higher kz remain zero
+        return out
+
+    def _truncate_from3_halfrfft(self, A_pad_hat):
+        """
+        Truncate a padded rFFT half-spectrum of shape (Np,Np,Np//2+1) down to base
+        (Nx,Ny,Nz//2+1).
+        """
+        Np, _, zfp = A_pad_hat.shape
+        Nx, Ny, zf = self.Nx, self.Ny, self.zf
+        nxh = Nx//2; nyh = Ny//2
+        out = cp.zeros((Nx, Ny, zf), dtype=A_pad_hat.dtype)
+
+        out[0:nxh+1, 0:nyh+1, :zf] = A_pad_hat[0:nxh+1, 0:nyh+1, :zf]
+        out[0:nxh+1, nyh+1:Ny, :zf] = A_pad_hat[0:nxh+1, Np-(Ny-nyh-1):Np, :zf]
+        out[nxh+1:Nx, 0:nyh+1, :zf] = A_pad_hat[Np-(Nx-nxh-1):Np, 0:nyh+1, :zf]
+        out[nxh+1:Nx, nyh+1:Ny, :zf] = A_pad_hat[Np-(Nx-nxh-1):Np, Np-(Ny-nyh-1):Np, :zf]
+        return out
 
     # ---------------- utilities ----------------
     @staticmethod
@@ -118,9 +174,46 @@ class SpectralDNS:
         i = 1j
         F_hat = i*self.KX[None]*t_x + i*self.KY[None]*t_y + i*self.KZ[None]*t_z
 
-        # Dealias + project
-        F_hat *= self.dealias
-        F_hat = self._project_divfree(F_hat)
+        return F_hat
+
+    def _forcing_lowk_hat(self, U_hat):
+        """
+        Low-wavenumber forcing: ^f = alpha G Û, with alpha chosen so that
+        <f.u> = epsilon each step.
+        """
+        if self.forcing_eps is None:
+            return cp.zeros_like(U_hat)
+
+        # filtered velocity in spectral space
+        Uhat_f = cp.stack([self._G_lowk*U_hat[0],
+                           self._G_lowk*U_hat[1],
+                           self._G_lowk*U_hat[2]], axis=0)
+
+        # --- compute K_< directly in spectral space via Parseval (no IFFT) ---
+        Nxyz = self.Nx * self.Ny * self.Nz
+
+        # Hermitian weights for the rFFT axis (z):
+        zf = self.zf
+        wz = cp.ones((zf,), dtype=self.dtype)
+        if self.Nz % 2 == 0 and zf > 2:
+            wz[1:zf-1] = 2.0  # Nyquist plane counted once
+        elif self.Nz % 2 == 1 and zf > 1:
+            wz[1:] = 2.0
+
+        # broadcast weights
+        WZ = wz[None, None, :]
+
+        # apply normalization: divide by Nxyz^2 because rfftn/irfftn are unnormalized
+        mag2 = (cp.abs(Uhat_f[0])**2 + cp.abs(Uhat_f[1])**2 + cp.abs(Uhat_f[2])**2) * WZ
+        Klt = 0.5 * cp.sum(mag2) / (Nxyz**2)
+
+        alpha = self.forcing_eps / (2.0*Klt + 1e-30)  # scalar (CuPy)
+
+        # ^f = alpha * ^U_<   (already solenoidal)
+        F_hat = cp.stack([alpha*Uhat_f[0],
+                          alpha*Uhat_f[1],
+                          alpha*Uhat_f[2]], axis=0).astype(self.cdtype, copy=False)
+
         return F_hat
 
     def _project_divfree(self, A_hat):
@@ -166,58 +259,99 @@ class SpectralDNS:
             return N_hat
         else:
             return N_hat_s
+    
+    def _nonlinear_hat_three_halves(self, U_hat):
+        """
+        Exact quadratic de-aliasing via 3/2 padding.
+        Steps:
+        1) pad Û and Ŵ to Np = 3N/2
+        2) irfftn on padded grids -> u_pad, w_pad
+        3) compute u×w on padded grid
+        4) rfftn back, then truncate to base grid
+        5) final projection to divergence-free happens in caller
+        """
+        Nx = self.Nx
+        Np = (3 * Nx) // 2
+        assert 2*Np % 3 == 0, "Np must be 3/2*N (even)"
+
+        # vorticity in spectral (base)
+        W_hat = self._curl_hat(U_hat)
+
+        # pad spectra to Np
+        U0p = self._pad3_halfrfft(U_hat[0], Np)
+        U1p = self._pad3_halfrfft(U_hat[1], Np)
+        U2p = self._pad3_halfrfft(U_hat[2], Np)
+        W0p = self._pad3_halfrfft(W_hat[0], Np)
+        W1p = self._pad3_halfrfft(W_hat[1], Np)
+        W2p = self._pad3_halfrfft(W_hat[2], Np)
+
+        # inverse FFT on padded grid (real)
+        u0 = irfftn(U0p, s=(Np, Np, Np), axes=(-3, -2, -1))
+        u1 = irfftn(U1p, s=(Np, Np, Np), axes=(-3, -2, -1))
+        u2 = irfftn(U2p, s=(Np, Np, Np), axes=(-3, -2, -1))
+        w0 = irfftn(W0p, s=(Np, Np, Np), axes=(-3, -2, -1))
+        w1 = irfftn(W1p, s=(Np, Np, Np), axes=(-3, -2, -1))
+        w2 = irfftn(W2p, s=(Np, Np, Np), axes=(-3, -2, -1))
+
+        # nonlinear on padded grid
+        Nx_hat_p = rfftn(u1*w2 - u2*w1, axes=(-3, -2, -1))
+        Ny_hat_p = rfftn(u2*w0 - u0*w2, axes=(-3, -2, -1))
+        Nz_hat_p = rfftn(u0*w1 - u1*w0, axes=(-3, -2, -1))
+
+        # truncate to base grid
+        Nx_hat = self._truncate_from3_halfrfft(Nx_hat_p)
+        Ny_hat = self._truncate_from3_halfrfft(Ny_hat_p)
+        Nz_hat = self._truncate_from3_halfrfft(Nz_hat_p)
+
+        return cp.stack([Nx_hat, Ny_hat, Nz_hat], axis=0)
 
     def _rhs(self, U_hat):
-        # viscosity term (always)
+        # viscosity term
         visc_hat = -(self.nu * self.K2)[None, ...] * U_hat
+        visc_hat *= self.dealias
 
-        # Smagorinsky SGS (optional, explicit)
+        # Smagorinsky SGS
         if self.les_model == "smagorinsky":
-            F_hat = self._sgs_smagorinsky(U_hat)
+            SGS_hat = self._sgs_smagorinsky(U_hat)
+            SGS_hat *= self.dealias
         else:
-            F_hat = 0.0
+            SGS_hat = 0.0
 
-        if self.dealias_mode == "phase_shift":
-            # ensure spacings are ready
-            if not hasattr(self, "dx_min"):
-                self.__post_init_precompute()
+        # Forcing
+        if (self.forcing_eps is not None):
+            Fforce_hat = self._forcing_lowk_hat(U_hat)
+        else:
+            Fforce_hat = 0.0
 
-            # half-cell shift in all directions
-            dxh, dyh, dzh = 0.5*self.dx, 0.5*self.dy, 0.5*self.dz
-            phase = self._phase_factor(dxh, dyh, dzh)
+        if self.dealias_mode == "three_halves":
+            N_hat = self._nonlinear_hat_three_halves(U_hat)
+            N_hat *= self.dealias
+            return self._project_divfree(N_hat + visc_hat + SGS_hat + Fforce_hat)
 
-            # unshifted nonlinear term
-            N0_hat = self._nonlinear_hat_from_Uhat(U_hat, phase=None)
-            # shifted nonlinear term (computed on shifted grid, unshifted back)
-            N1_hat = self._nonlinear_hat_from_Uhat(U_hat, phase=phase)
+        elif self.dealias_mode == "phase_shift":
+            # compute N_hat for each shift on the shifted grid, then unshift back and average
+            N_acc = 0.0
+            for phase in self._phases8:                     # includes (0,0,0)
+                N_shift = self._nonlinear_hat_from_Uhat(U_hat, phase=phase)
+                N_acc += N_shift
+            N_hat = (N_acc / len(self._phases8))
+            return self._project_divfree(N_hat + visc_hat + SGS_hat + Fforce_hat)
 
-            # average to cancel aliases
-            N_hat = 0.5*(N0_hat + N1_hat)
+        else:
+            # --- default path (your existing dealiasing) ---
+            # compute curl, go to real space
+            W_hat = self._curl_hat(U_hat)
+            U = self._ifft3c(U_hat)
+            W = self._ifft3c(W_hat)
 
-            # pressure projection
-            N_hat = self._project_divfree(N_hat)
+            Nx_hat = self._fft3r(U[1]*W[2] - U[2]*W[1])
+            Ny_hat = self._fft3r(U[2]*W[0] - U[0]*W[2])
+            Nz_hat = self._fft3r(U[0]*W[1] - U[1]*W[0])
+            N_hat = cp.stack([Nx_hat, Ny_hat, Nz_hat], axis=0)
 
-            # (optional) very light safety masking if you want — usually not needed:
-            # N_hat *= self.dealias
+            N_hat *= self.dealias
 
-            return N_hat + visc_hat + F_hat
-
-        # --- default path (your existing dealiasing) ---
-        # compute curl, go to real space
-        W_hat = self._curl_hat(U_hat)
-        U = self._ifft3c(U_hat)
-        W = self._ifft3c(W_hat)
-
-        Nx_hat = self._fft3r(U[1]*W[2] - U[2]*W[1])
-        Ny_hat = self._fft3r(U[2]*W[0] - U[0]*W[2])
-        Nz_hat = self._fft3r(U[0]*W[1] - U[1]*W[0])
-        N_hat = cp.stack([Nx_hat, Ny_hat, Nz_hat], axis=0)
-
-        # classic dealias + projection
-        N_hat *= self.dealias
-        N_hat = self._project_divfree(N_hat)
-
-        return N_hat + visc_hat + F_hat
+            return self._project_divfree(N_hat + visc_hat + SGS_hat + Fforce_hat)
 
     def _rk4(self, U_hat, dt):
         k1 = self._rhs(U_hat)
@@ -252,6 +386,15 @@ class SpectralDNS:
         # max resolved k^2 after dealiasing (safest for diffusion limit)
         k2_masked = cp.where(self.dealias, self.K2, 0.0)
         self.k2_max = float(k2_masked.max().get())  # scalar on host
+
+        if self.dealias_mode == "phase_shift":
+            dxh, dyh, dzh = 0.5*self.dx, 0.5*self.dy, 0.5*self.dz
+            # 8 combinations of (0 or 0.5*h) per axis
+            self._phases8 = []
+            for ax in (0.0, dxh):
+                for ay in (0.0, dyh):
+                    for az in (0.0, dzh):
+                        self._phases8.append(self._phase_factor(ax, ay, az))  # shape (Nx,Ny,zf)
 
     def _umax(self):
         U = self._ifft3c(self.U_hat)
@@ -407,7 +550,7 @@ class SpectralDNS:
             self.U_hat[c] = self._fft3r(U[c]).astype(self.cdtype, copy=False)
         # ensure ∇·u = 0 after any filtering/rescaling
         self.U_hat = self._project_divfree(self.U_hat)
-    
+
     def save_velocity_vti(self, filename="velocity.vti"):
         """
         Save the current velocity field to a VTK .vti file (ImageData format)
@@ -426,6 +569,11 @@ class SpectralDNS:
         dy = self.L / Ny
         dz = self.L / Nz
 
+        # --- vorticity in real space (via spectral curl) ---
+        W_hat = self._curl_hat(self.U_hat)     # (3, Nx, Ny, zf), complex on GPU
+        W = self._ifft3c(W_hat)                # (3, Nx, Ny, Nz), real on GPU
+        wx, wy, wz = [comp.get() for comp in W]  # CuPy -> NumPy
+
         # Create VTK image data object
         imageData = vtk.vtkImageData()
         imageData.SetDimensions(Nx, Ny, Nz)
@@ -441,6 +589,13 @@ class SpectralDNS:
         vtk_array.SetName("Velocity")
         imageData.GetPointData().AddArray(vtk_array)
         imageData.GetPointData().SetActiveVectors("Velocity")
+
+        Wv = np.stack([wx, wy, wz], axis=-1).astype(np.float32)
+        Wv_flat = np.ascontiguousarray(Wv.reshape(-1, 3), dtype=np.float32)
+        vtk_array = vtknp.numpy_to_vtk(num_array=Wv_flat, deep=True, array_type=vtk.VTK_FLOAT)
+        vtk_array.SetName("Vorticity")
+        imageData.GetPointData().AddArray(vtk_array)
+        imageData.GetPointData().SetActiveVectors("Vorticity")
 
         # Write .vti file
         writer = vtk.vtkXMLImageDataWriter()
@@ -479,7 +634,7 @@ def taylor_green_ic(X):
 if __name__ == "__main__":
 
     # 2/3 dealiasing
-    solver = SpectralDNS(N=128, nu=1.0/1600, precision="float32", dealias_mode="two_thirds")
+    solver = SpectralDNS(N=128, nu=1.0/1600, precision="float64", dealias_mode="two_thirds")
 
     solver.prepare_ic(taylor_green_ic)
     solver.run(T=10.0, cfl=0.8, fourier=0.3, log_every=1,
@@ -491,7 +646,20 @@ if __name__ == "__main__":
     print(f"TKE(real)={TKE_real:.6e}  TKE(spec)={TKE_spec:.6e}  rel.err={(abs(TKE_real-TKE_spec)/TKE_real):.3e}")
 
     # phase shift dealiasing
-    solver = SpectralDNS(N=128, nu=1.0/1600, precision="float32", dealias_mode="phase_shift")
+    solver = SpectralDNS(N=128, nu=1.0/1600, precision="float64", dealias_mode="phase_shift")
+
+    # Run 1: Taylor–Green for T=0.05
+    solver.prepare_ic(taylor_green_ic)
+    solver.run(T=10.0, cfl=0.8, fourier=0.3, log_every=1,
+               callback=lambda t, s, _: print(f"[TG] t={s['t']:.3f}, E={s['kinetic_energy']:.6f}"))
+
+    k, E_k, dk = solver.energy_spectrum()
+    TKE_spec = cp.sum(E_k * dk)
+    TKE_real = solver.kinetic_energy()
+    print(f"TKE(real)={TKE_real:.6e}  TKE(spec)={TKE_spec:.6e}  rel.err={(abs(TKE_real-TKE_spec)/TKE_real):.3e}")
+
+    # 3/2 padding dealiasing
+    solver = SpectralDNS(N=128, nu=1.0/1600, precision="float64", dealias_mode="three_halves")
 
     # Run 1: Taylor–Green for T=0.05
     solver.prepare_ic(taylor_green_ic)

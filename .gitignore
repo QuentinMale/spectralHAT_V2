@@ -1,0 +1,4 @@
+*.pdf
+*.vti
+*.txt
+__pycache__

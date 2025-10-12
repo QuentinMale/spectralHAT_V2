@@ -1,5 +1,7 @@
 import cupy as cp
 import numpy as np
+import time
+import scipy.interpolate as spi
 from spectralHAT.hat import SpectralDNS
 import os, io
 
@@ -200,7 +202,7 @@ def build_hit_initial_field(N, L, target_E_of_k, seed=1234):
     cp.random.seed(seed)
 
     # 1) start from 3 real white-noise fields
-    U0 = cp.random.standard_normal((3, N, N, N), dtype=cp.float32)
+    U0 = cp.random.standard_normal((3, N, N, N), dtype=cp.float64)
 
     # 2) FFT to k-space and project to solenoidal
     uhat = cp.fft.fftn(U0, axes=(1,2,3))
@@ -212,10 +214,10 @@ def build_hit_initial_field(N, L, target_E_of_k, seed=1234):
     k0 = 0.0                       # start shells at 0, [0,dk), [dk,2dk), ...
     shell_ids = shell_partition(K, k0, dk)
     sidx = cp.unique(shell_ids)    # valid shells that actually appear
-    k_centers = (cp.asarray(sidx, dtype=cp.float32) + 0.5) * dk  # center of each shell
+    k_centers = (cp.asarray(sidx, dtype=cp.float64) + 0.5) * dk  # center of each shell
     k_centers_np = cp.asnumpy(k_centers)                          # to numpy
     E_target_np = target_E_of_k(k_centers_np)                     # numpy
-    E_target = cp.asarray(E_target_np, dtype=cp.float32)
+    E_target = cp.asarray(E_target_np, dtype=cp.float64)
 
     # Convert 1D spectrum (per dk) to discrete shell energy target:
     # E_shell_target ≈ E(k_center) * dk
@@ -240,7 +242,7 @@ def build_hit_initial_field(N, L, target_E_of_k, seed=1234):
     # uhat = uhat * mask[None, ...]
 
     # 5) IFFT back to real space
-    U = cp.fft.ifftn(uhat, axes=(1,2,3)).real.astype(cp.float32)
+    U = cp.fft.ifftn(uhat, axes=(1,2,3)).real.astype(cp.float64)
     return U  # shape (3,N,N,N)
 
 if __name__ == "__main__":
@@ -251,21 +253,19 @@ if __name__ == "__main__":
 
     os.makedirs('SOLUT', exist_ok=True)
 
-    # Prepare IC: ignore X, just return our precomputed field
-    def hit_ic(_X):
-        return U0
-
     # ---------------- First run to have a realistic turbulent field
-    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float32", dealias_mode="phase_shift")
+    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float64", dealias_mode="three_halves")
 
     # Build an initial field matching E_kcm(k)
     U0 = build_hit_initial_field(N, float(L.get() if hasattr(L,'get') else L),
                                  target_E_of_k=spec.evaluate,
                                  seed=42)
-    solver.prepare_ic(hit_ic)
+    solver.set_velocity_real(cp.asarray(U0[0,:,:,:], dtype=solver.dtype),
+                             cp.asarray(U0[1,:,:,:], dtype=solver.dtype),
+                             cp.asarray(U0[2,:,:,:], dtype=solver.dtype))
 
     logger = RefTimeseriesLogger(path="temporals.txt", also_print=False)
-    solver.run(T=0.38, cfl=0.8, fourier=0.3, log_every=1,
+    solver.run(T=0.20, cfl=0.8, fourier=0.3, log_every=1,
                callback=logger)
     logger.close()
     u, v, w = solver.get_velocity_real()
@@ -273,12 +273,11 @@ if __name__ == "__main__":
     os.system('rm -r SOLUT/* SPECTRA/*')
 
     # ---------------- Second run rescaling the velocity field to match the target initial spectrum
-    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float32", dealias_mode="phase_shift")
+    solver = SpectralDNS(N=N, L=L, nu=nu, les_model="smagorinsky", Cs=0.2, precision="float64", dealias_mode="three_halves")
 
     # Rescale
     u2, v2, w2 = rescale_to_kcm((u, v, w), L=solver.L, N=solver.Nx, station=0)    
-    U0 = cp.stack([u2, v2, w2], axis=0).astype(solver.dtype, copy=False)
-    solver.prepare_ic(hit_ic)
+    solver.set_velocity_real(u2,v2,w2)
 
     logger = RefTimeseriesLogger(path="temporals.txt", also_print=False)
     solver.run(T=0.38, cfl=0.8, fourier=0.3, log_every=1, sol_every=10,
